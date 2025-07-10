@@ -6,36 +6,17 @@ app = marimo.App(width="full", app_title="Dialect Scaling Laws")
 
 @app.cell
 def _(mo):
-    def _marimo_theme(default: str = "light") -> str:
-        """
-        Returns 'dark' or 'light' depending on the active Marimo theme.
-        Falls back to *default* if executed outside Marimo.
-        """
-        try:
-            return mo.app_meta().theme           # "dark" | "light" 
-        except Exception:
-            return default
-
-    import plotly.io as pio
-    TEMPLATE_MAP = {"dark": "plotly_dark", "light": "plotly_white"}
-
-    def apply_plotly_theme():
-        tmpl = TEMPLATE_MAP[_marimo_theme()]
-        pio.templates.default = tmpl            # global override
-        return tmpl
+    from utils.theme import apply_plotly_theme
     return (apply_plotly_theme,)
 
 
 @app.cell
 def _():
-    import wandb
+    from utils.wandb_utils import login_and_get_runs
 
-    _ = wandb.login()
-
-    api = wandb.Api()
-
-    runs = api.runs(
-        "marin-community/marin", filters={"name": {"$regex": "Domain-Scaling-Laws-.*"}}
+    runs = login_and_get_runs(
+        "marin-community/marin",
+        {"name": {"$regex": "Domain-Scaling-Laws-.*"}},
     )
 
     options = [key for key in runs[0].summary.keys() if "bpb" in key or "loss" in key]
@@ -59,79 +40,8 @@ def _(mo):
 @app.cell
 def _():
     import marimo as mo
+    from utils.flops import flops_per_token_gqa
 
-    VOCAB_OURS = 50304
-    SEQ_LEN = 2048
-    WORLD_BATCH_SIZE = 2048.0
-    HEAD_SIZE = 128
-    EXPAND_FACTOR = 4.0
-
-
-    def flops_per_token_gqa(
-        width,
-        depth,
-        vocab_size=VOCAB_OURS,
-        queries_per_group=2,
-        seq_len=SEQ_LEN,
-    ):
-        """
-        Some details (negligible even for extremely wide models) omitted, including:
-        * numerically stable softmax
-        * softmax addition only being over rows
-        * dot products being only n-1 additions (fused multiply-add exists anyway)
-        """
-        num_qheads = width / HEAD_SIZE
-        num_kvheads = 2 * num_qheads / queries_per_group
-
-        embeddings = 0  # 0 if sparse lookup, backward FLOPs negligible
-        attention = 2.0 * seq_len * (num_qheads + num_kvheads) * width * HEAD_SIZE
-        attention += (
-            3.5 * seq_len * (num_qheads + num_kvheads / 2) * HEAD_SIZE
-        )  # RoPE, as implemented here/GPT-NeoX
-
-        # score FLOPs are halved because causal => triangular mask => usable sparsity
-        kq_logits = 1.0 * seq_len * seq_len * HEAD_SIZE * num_qheads
-        softmax = 3.0 * seq_len * seq_len * num_qheads
-        softmax_q_red = 2.0 * seq_len * seq_len * HEAD_SIZE * num_qheads
-        final_linear = 2.0 * seq_len * width * HEAD_SIZE * num_qheads
-
-        attn_bwd = (
-            2.0 * attention
-            + 2.5 * (kq_logits + softmax + softmax_q_red)
-            + 2.0 * final_linear
-        ) * depth
-
-        attention += kq_logits + softmax + softmax_q_red + final_linear
-
-        ffw_size = EXPAND_FACTOR * width
-        dense_block = (
-            6.0 * seq_len * width * ffw_size
-        )  # three matmuls instead of usual two because of GEGLU
-        dense_block += (
-            10 * seq_len * ffw_size
-        )  # 7 for other ops: 3 for cubic, two additions, two scalar mults
-        dense_block += 2.0 * width * seq_len  # both/sandwich residual additions
-
-        rmsnorm = 2 * 7.0 * width * seq_len
-        final_rms_norm = 7.0 * width * seq_len  # one last RMSNorm
-        final_logits = 2.0 * seq_len * width * vocab_size
-
-        nonattn_bwd = 2.0 * (
-            embeddings
-            + depth * (dense_block + rmsnorm)
-            + final_rms_norm
-            + final_logits
-        )
-
-        forward_pass = (
-            embeddings
-            + depth * (attention + dense_block + rmsnorm)
-            + final_rms_norm
-            + final_logits
-        )
-
-        backward_pass = attn_bwd + nonattn_bwd  # flash attention
-        return (forward_pass + backward_pass) / seq_len
     return flops_per_token_gqa, mo
 
 
